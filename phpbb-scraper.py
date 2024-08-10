@@ -26,6 +26,7 @@ from queue import Empty
 import multiprocessing as mp
 from bs4 import BeautifulSoup
 
+import base64
 
 scraper_opts = {
   'parser': 'lxml',
@@ -40,7 +41,7 @@ scraper_opts = {
   'save_users': False,
   'force': 0,
   'max_workers': 10,
-  'pool_size': 1000,
+  'pool_size': 10,
   'max_retries': 3,
   'timeout': 30.0,
   'passwords': {'f': {}, 't': {}, 'u': None}
@@ -55,6 +56,15 @@ def send_worker(r):
       return req, req.obj
     except requests.exceptions.ConnectionError as e:
       retry += 1
+    except requests.exceptions.InvalidSchema as e:
+      logging.error('Invalid URL schema: {}'.format(e))
+      return None, None
+    except IndexError as e:
+      logging.error('Index error: {}'.format(e))
+      logging.error('  URL: {}'.format(r))
+      sys.exit(1)
+
+      return None, None
 
   logging.warning('Failed to request {}'.format(r))
   return None, None
@@ -68,7 +78,7 @@ def scrape_worker(args):
   if not ok:
     logging.warning('{} failed to fetch'.format(obj))
     return []
-
+  
   pages = obj.scrape(r, page_merger)
   return pages
 
@@ -381,9 +391,10 @@ class PhpBBForum(PhpBBElement):
         pages.append(PhpBBForum(self._opts, self._session, fid, 0))
       return pages
 
-    for f in self._page.select('div#page-body > div.forabg li.row > dl > dt a.forumtitle'):
-      fid = self._get_url_query(f['href'])['f']
-      pages.append(PhpBBForum(self._opts, self._session, fid, 0))
+    # Skip subforums
+    # for f in self._page.select('div#page-body > div.forabg li.row > dl > dt a.forumtitle'):
+    #   fid = self._get_url_query(f['href'])['f']
+    #   pages.append(PhpBBForum(self._opts, self._session, fid, 0))
 
     for f in self._page.select('div#page-body > div.forumbg li.row > dl > dt a.topictitle'):
       tid = int(self._get_url_query(f['href'])['t'])
@@ -442,7 +453,9 @@ class PhpBBTopic(PhpBBElement):
 
 
   def _parse_page(self):
+    
     for p in self._page.select('div.post'):
+
       pid = p['id'][1:]
       post = {
        'msg_id': int(pid)
@@ -465,6 +478,10 @@ class PhpBBTopic(PhpBBElement):
       for img in p.select('dl.attachbox img.postimage'):
         post['files'].append((img['alt'], '{}/{}'.format(self._opts['url'], img['src'])))
         img.decompose()
+
+      post ['subject'] = self._topic_title
+      post ['topic_id'] = self._topic_id
+      post ['forum'] = self._forum_id
 
       self._posts.append(post)
 
@@ -718,7 +735,7 @@ class PhpBBTopic(PhpBBElement):
     mpaths = [opts['output']]
     for p in paths:
       mpaths.append(p[0])
-      mname = os.path.join(*mpaths, '.meta.json')
+      mname = os.path.join(*mpaths, '_meta.json')
       if os.path.isfile(mname):
         continue
       try:
@@ -922,21 +939,28 @@ class PhpBBScraper:
 
     pool = mp.pool.ThreadPool(processes=self._opts['pool_size'])
     while not self._queue.is_done():
-      for response, obj in pool.imap_unordered(send_worker, self._queue):
-        if response is None:
-          self.processed()
-          yield (False, obj, None, None)
-          continue
+      #try:
+        for response, obj in pool.imap_unordered(send_worker, self._queue):
+          if response is None:
+            self.processed()
+            yield (False, obj, None, None)
+            continue
 
-        if isinstance(obj, PhpBBTopic) and obj._start == 0:
-          self._processed_pages += 1
-        if response.status_code == 200:
-          # Yield good result, no repsonse needed to pass back
-          yield (True, obj, response, self._page_merger)
-        else:
-          # Bad status received, push back the repsonse details
-          self.processed()
-          yield (False, obj, response, None)
+          if isinstance(obj, PhpBBTopic) and obj._start == 0:
+            self._processed_pages += 1
+
+          if response.status_code == 200:
+            # Yield good result, no response needed to pass back
+            yield (True, obj, response, self._page_merger)
+          else:
+            # Bad status received, push back the response details
+            self.processed()
+            yield (False, obj, response, None)
+
+      #except requests.exceptions.InvalidSchema as e:
+      #     logging.error(f'Invalid schema encountered for {obj}: {e}')
+      #     self.processed()
+      #     continue
 
     pool.close()
     pool.join()
@@ -1007,7 +1031,7 @@ class PhpBBScraper:
     logging.info('Searching for downloaded topics in {}'.format(self._opts['output']))
     for dname, subdirs, flist in os.walk(self._opts['output']):
       for f in flist:
-        if f == '.meta.json':
+        if f == '_meta.json':
           continue
         if '.json' in f:
           try:
@@ -1023,8 +1047,14 @@ def usage(rc):
 
 
 def main():
+  # Clean up any extra spaces in the command-line arguments
+  args = []
+  for arg in sys.argv[1:]:
+    if arg.strip():  # Ignore empty strings resulting from spaces
+      args.append(arg.strip())
+
   try:
-    opts, args = getopt.getopt(sys.argv[1:],
+    opts, args = getopt.getopt(args,
       'hf:t:w:a:c:mso:up:v', [
       'help',
       'force',
@@ -1040,8 +1070,9 @@ def main():
       'output=',
       'parse-date',
     ])
-    if args:
-      scraper_opts['url'] = args[0]
+
+    scraper_opts['url'] = args[-1]
+    
   except getopt.GetoptError as err:
     print(err)
     usage(2)
@@ -1095,16 +1126,20 @@ def main():
   urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
   start_ = time.time()
 
+  print('Starting phpBB scraper for {}'.format(scraper_opts['url']))
+
   web = PhpBBScraper(scraper_opts, forums, topics)
 
   pool = mp.Pool(processes=scraper_opts['max_workers'])
+
   while True:
     for pages in pool.imap_unordered(scrape_worker, web.scrape()):
-      web.enqueue(pages)
-      web.processed()
-    if web.is_done():
-      break
+        web.enqueue(pages)
+        web.processed()
 
+    if web.is_done():
+        break  # Exit the loop if all work is done
+    
   pool.close()
   pool.join()
 
