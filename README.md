@@ -76,7 +76,10 @@ Options:
       Y-m-d H:i:s T
 
   -v
-    Increase verbosity level. Could be specified multiple times.
+    Increase verbosity level (from WARNING). Could be specified multiple times (WARNING->INFO->DEBUG)
+
+  -l, --logfile FILE
+    Log to FILE. If not specified, logging will be to console.
 
   -h, --help
     This message

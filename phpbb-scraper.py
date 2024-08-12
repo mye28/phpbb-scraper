@@ -26,14 +26,13 @@ from queue import Empty
 import multiprocessing as mp
 from bs4 import BeautifulSoup
 
-import base64
-
 scraper_opts = {
   'parser': 'lxml',
 #  'parser': 'html.parser',
   'headers': {},
   'output': None,
   'log_level': logging.WARNING,
+  'log-file': None,
   'lc_time': ('ru_RU', 'utf-8'),
   'parse_date': False,
   'save_media': False,
@@ -41,7 +40,7 @@ scraper_opts = {
   'save_users': False,
   'force': 0,
   'max_workers': 10,
-  'pool_size': 10,
+  'pool_size': 1000,
   'max_retries': 3,
   'timeout': 30.0,
   'passwords': {'f': {}, 't': {}, 'u': None}
@@ -57,16 +56,21 @@ def send_worker(r):
     except requests.exceptions.ConnectionError as e:
       retry += 1
     except requests.exceptions.InvalidSchema as e:
-      logging.error('Invalid URL schema: {}'.format(e))
+      logging.debug('InvalidSchema: {}'.format(e))
+      return None, None
+    except requests.exceptions.MissingSchema as e:
+      logging.debug('MissingSchema: {}'.format(e))
       return None, None
     except IndexError as e:
       logging.error('Index error: {}'.format(e))
       logging.error('  URL: {}'.format(r))
       sys.exit(1)
 
-      return None, None
-
-  logging.warning('Failed to request {}'.format(r))
+  # Only log if r has a url property and that property ends with .html
+  if hasattr(r, 'url') and r.url.endswith('.html'):
+    logging.warning('After {} requests failed to fetch {}'.format(retry, r))
+  else:
+    logging.debug('After {} requests failed to fetch {}'.format(retry, r))
   return None, None
 
 
@@ -76,7 +80,7 @@ def scrape_worker(args):
     return []
 
   if not ok:
-    logging.warning('{} failed to fetch'.format(obj))
+    #logging.warning('Failed to fetch {}'.format(obj))
     return []
   
   pages = obj.scrape(r, page_merger)
@@ -197,7 +201,8 @@ class FileSaver:
   def scrape(self, resp, page_merger):
     fname = FileSaver.full_path(self._opts['output'], self._paths, self._fname)
     dname = os.path.dirname(fname)
-    logging.info('Saving {} [{} bytes, {}]'.format(fname, len(resp.content), resp.headers['Content-Type']))
+    logging.info('Saving {} [{} bytes]'.format(fname, len(resp.content)))
+    #logging.info('Saving {} [{} bytes, {}]'.format(fname, len(resp.content), resp.headers['Content-Type']))
 
     try:
       os.makedirs(dname, exist_ok=True)
@@ -247,6 +252,7 @@ class PhpBBElement:
 
 
   def _pagination(self):
+
     self._path = []
 
     breadcrumbs = self._page.select('#nav-breadcrumbs > li.breadcrumbs > span.crumb[data-forum-id]')
@@ -276,7 +282,11 @@ class PhpBBElement:
           deltas.add(starts[i] - starts[i-1])
         start_value = min(deltas)
 
+    if len(self._page.select('div.action-bar.bar-top > div.pagination')) == 0:
+      return url, 0, 0
+    
     pgs = self._page.select('div.action-bar.bar-top > div.pagination')[0]
+
     try:
       pgs.ul.decompose()
       pgs.a.decompose()
@@ -284,6 +294,7 @@ class PhpBBElement:
       pass
     m = re.search(r'^[^\d+]*(\d+)', pgs.text.strip())
     self._elements_count = int(m.group(1))
+
     if pages_count == 1:
       start_value = self._elements_count
 
@@ -322,6 +333,8 @@ class PhpBBForumPassword(PhpBBElement):
 
   def scrape(self, resp, page_merger):
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
+
+    logging.debug('PhpBBForumPassword.scrape: {}'.format(self._page.title.string))
 
     msg = self._page.select('#message p')
     if msg:
@@ -364,6 +377,7 @@ class PhpBBForum(PhpBBElement):
 
 
   def scrape(self, resp, page_merger):
+    logging.debug('PhpBBForum.scrape:')
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
 
     msg = self._page.select('#message p')
@@ -384,14 +398,14 @@ class PhpBBForum(PhpBBElement):
                                  self._page, self._opts['passwords']['f'][self._forum_id])]
 
     pages = []
-    if not self._forum_id:
-      # Queue forums list only
-      for f in self._page.select('div#page-body > div.forabg li.header a'):
+    if self._forum_id == 0:
+    # Queue forums list only
+      for f in self._page.select('div#page-body > div.forabg li.row > dl > dt a.forumtitle'):
         fid = self._get_url_query(f['href'])['f']
         pages.append(PhpBBForum(self._opts, self._session, fid, 0))
       return pages
 
-    # Skip subforums
+    #Subforums
     # for f in self._page.select('div#page-body > div.forabg li.row > dl > dt a.forumtitle'):
     #   fid = self._get_url_query(f['href'])['f']
     #   pages.append(PhpBBForum(self._opts, self._session, fid, 0))
@@ -399,6 +413,7 @@ class PhpBBForum(PhpBBElement):
     for f in self._page.select('div#page-body > div.forumbg li.row > dl > dt a.topictitle'):
       tid = int(self._get_url_query(f['href'])['t'])
       if tid not in self._opts['scraped_topics']:
+        logging.info('Queue forum {} topic {}'.format(self._forum_id, tid))
         pages.append(PhpBBTopic(self._opts, self._session, tid, 0))
 
     if self._start != 0:
@@ -532,7 +547,6 @@ class PhpBBTopic(PhpBBElement):
 
     return None      
 
-
   def _html2bb(self, content):
     res = {'files': []}
     if self._opts['save_media']:
@@ -572,7 +586,6 @@ class PhpBBTopic(PhpBBElement):
       c.unwrap()
       cp.string = cp.string.replace('\n', '&#10;')
 
-
     self._replace_tags(content.find_all('pre'), '[code]', '[/code]')
 
     self._replace_tags(content.find_all('br'), '&#10;', '')
@@ -592,19 +605,29 @@ class PhpBBTopic(PhpBBElement):
 
     if self._opts['save_media']:
       for i in content.select('img.postimage'):
+        if len(i['src']) == 0:
+          #logging.error('img.postimage: Empty src in {} (url = {})'.format(i, self._topic_id))
+          continue
         if i['src'][0] == '.':
           i['src'] = '{}/{}'.format(self._opts['url'], i['src'])
+
+        # remove query string from URL
+        i['src'] = i['src'].split('?', 1)[0]
         res['media'].append((os.path.basename(i['src']), i['src']))
 
       for i in content.select('img[height]'):
+        if len(i['src']) == 0:
+          #logging.error('img[height]: Empty src in {} (url = {})'.format(i, self._topic_id))
+          continue
         if i['src'][0] == '.':
           i['src'] = '{}/{}'.format(self._opts['url'], i['src'])
+
+        # remove query string from URL
+        i['src'] = i['src'].split('?', 1)[0]
         res['media'].append((os.path.basename(i['src']), i['src']))
 
-    self._replace_tags(content.select('img.postimage'), '[img]{}', '[/img]',
-      lambda tag: tag['src'])
-    self._replace_tags(content.select('img[height]'), '[fimg={}]{}', '[/fimg]',
-      [lambda tag: tag['height'], lambda tag: tag['src']])
+    self._replace_tags(content.select('img.postimage'), '[img]{}', '[/img]', lambda tag: tag['src'])
+    self._replace_tags(content.select('img[height]'), '[fimg={}]{}', '[/fimg]', [lambda tag: tag['height'], lambda tag: tag['src']])
 
     self._replace_tags(content.find_all('ul'), '[list]', '[/list]')
     self._replace_tags(content.select('div[style*="padding:"]'), '[spoiler={}]', '[/spoiler]',
@@ -619,11 +642,19 @@ class PhpBBTopic(PhpBBElement):
       q = {'who': ''}
       if quote.cite:
         if not quote.cite.a:
-          q['who'] = '={}'.format(quote.cite.string.strip().rsplit(' ', 1)[0].replace(']', '\\]'))
+          if quote.cite.string:
+            q['who'] = '={}'.format(quote.cite.string.strip().rsplit(' ', 1)[0].replace(']', '\\]'))
+          elif quote.cite.text:
+            # A url?
+            q['who'] = '={}'.format(quote.cite.text)
         else:
-          q['who'] = '={} user_id={}'.format(
-            quote.cite.a.string.strip().replace(']', '\\]'),
-            self._get_url_query(quote.cite.a['href'])['u'])
+          uq = self._get_url_query(quote.cite.a['href'])
+          if 'u' in uq:
+            q['who'] = '={} user_id={}'.format(
+              quote.cite.a.string.strip().replace(']', '\\]'),
+              uq['u'])
+          else:
+            q['who'] = '={}'.format(quote.cite.a.string.strip().replace(']', '\\]'))
         pt = quote.cite.select('div.responsive-hide')
         if pt:
           qdate = pt[0].string.strip()
@@ -652,7 +683,11 @@ class PhpBBTopic(PhpBBElement):
 
 
   def scrape(self, resp, page_merger):
+    logging.info('PhpBBTopic')
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
+
+    logging.info('PhpBBTopic.scrape: {}'.format(self._page.title.string))
+
 #    self._page = BeautifulSoup('<html><body><blockquote><cite>asd]bbb</cite><div>LLLL</div></blockquote><div class="codebox"><p>KOD</p><pre><code>TEST CODE\nFFFF</code></pre></div><br/><span style="text-decoration:underline">UNDERLINE</span>\n\n<ul><li>ITEM1</li></ul><ol style="list-style-type:lower-alpha"><li>ITEM1</li></ol><ol style="list-style-type:decimal"><li>ITEM2</li></ol><img src="https://avatars.mds.yandex.net/get-banana/55914/x25Bic0D9kVbOCgUbeLnDbwof_banana_20161021_22_ret.png/optimize" height="200"><img src="https://avatars.mds.yandex.net/get-banana/55914/x25Bic0D9kVbOCgUbeLnDbwof_banana_20161021_22_ret.png/optimize"><a href="http://localhost/" class="postlink">http://localhost/</a><span style="color:red">RED</span><span style="font-size: 50%; line-height: normal">SMALL</span>&lt;aaa;&gt;&eacute;</body></html>', self._opts['parser'])
 #    self._html2bb(self._page)
 
@@ -774,7 +809,11 @@ class PhpBBUsers(PhpBBElement):
 
 
   def scrape(self, resp, page_merger):
+    logging.info('PhpBBUsers.scrape')
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
+
+    logging.info('PhpBBUsers.scrape: {}'.format(self._page.title.string))
+    
     msg = self._page.select('#message p')
     if msg:
       logging.error('Fetch users failed: {}'.format(msg[0].string.strip()))
@@ -932,35 +971,30 @@ class PhpBBScraper:
   def is_done(self):
     return self._queue.is_done()
 
-
   def scrape(self):
+    logging.debug('PhpBBScraper.scrape: {}'.format(self._topics))
     self.enqueue(self._topics)
     self._topics = []
 
     pool = mp.pool.ThreadPool(processes=self._opts['pool_size'])
     while not self._queue.is_done():
-      #try:
-        for response, obj in pool.imap_unordered(send_worker, self._queue):
-          if response is None:
-            self.processed()
-            yield (False, obj, None, None)
-            continue
+      for response, obj in pool.imap_unordered(send_worker, self._queue):
+        if response is None:
+          self.processed()
+          yield (False, obj, None, None)
+          continue
 
-          if isinstance(obj, PhpBBTopic) and obj._start == 0:
-            self._processed_pages += 1
+        if isinstance(obj, PhpBBTopic) and obj._start == 0:
+          self._processed_pages += 1
 
-          if response.status_code == 200:
-            # Yield good result, no response needed to pass back
-            yield (True, obj, response, self._page_merger)
-          else:
-            # Bad status received, push back the response details
-            self.processed()
-            yield (False, obj, response, None)
+        if response.status_code == 200:
+          # Yield good result, no response needed to pass back
+          yield (True, obj, response, self._page_merger)
+        else:
+          # Bad status received, push back the response details
+          self.processed()
+          yield (False, obj, response, None)
 
-      #except requests.exceptions.InvalidSchema as e:
-      #     logging.error(f'Invalid schema encountered for {obj}: {e}')
-      #     self.processed()
-      #     continue
 
     pool.close()
     pool.join()
@@ -1039,10 +1073,11 @@ class PhpBBScraper:
             self._opts['scraped_topics'].append(tid)
           except:
             pass
+    logging.info('{} topics already scraped'.format(len(self._opts['scraped_topics'])))
 
 
 def usage(rc):
-  print('Usage: {} [-v|-h|-w workers|-p pool-size|-o output-dir|-a user-agent|-c cookie|-m|-s|[-t|-f] id[-id|,id]] URL\n'.format(os.path.basename(sys.argv[0])))
+  print('Usage: {} [-v|-h|-w workers|-p pool-size|-o output-dir|-a user-agent|-c cookie|-m|-s|[-t|-f] id[-id|,id] [-l log-file]] URL\n'.format(os.path.basename(sys.argv[0])))
   sys.exit(rc)
 
 
@@ -1055,7 +1090,7 @@ def main():
 
   try:
     opts, args = getopt.getopt(args,
-      'hf:t:w:a:c:mso:up:v', [
+      'hf:t:w:a:c:mso:up:vl:', [
       'help',
       'force',
       'forum=',
@@ -1068,6 +1103,7 @@ def main():
       'save-attachments',
       'save-users',
       'output=',
+      'log-file=',
       'parse-date',
     ])
 
@@ -1083,6 +1119,7 @@ def main():
   topics = []
   forums = []
   logger_fmt='%(levelname)s: %(message)s'
+
   for o, a in opts:
     if o in ('-h', '--help'):
       usage(0)
@@ -1110,6 +1147,8 @@ def main():
       scraper_opts['save_users'] = True
     elif o in ('-o', '--output='):
       scraper_opts['output'] = a
+    elif o in ('-l', '--log-file='):
+      scraper_opts['log-file'] = a
     elif o == '-v':
       if scraper_opts['log_level'] == logging.WARNING:
         scraper_opts['log_level'] = logging.INFO
@@ -1120,13 +1159,36 @@ def main():
   if scraper_opts['output'] is None:
     scraper_opts['output'] = requests.utils.urlparse(scraper_opts['url']).netloc
 
-  logging.basicConfig(level=scraper_opts['log_level'], format=logger_fmt)
-  locale.setlocale(locale.LC_TIME, scraper_opts['lc_time'])
-
-  urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
   start_ = time.time()
 
-  print('Starting phpBB scraper for {}'.format(scraper_opts['url']))
+  logging.getLogger().setLevel(logging.DEBUG)
+  formatter = logging.Formatter(logger_fmt)
+
+  if scraper_opts['log-file'] is not None:
+    fh = logging.FileHandler(scraper_opts['log-file'])
+    fh.setFormatter(formatter)
+    fh.setLevel(scraper_opts['log_level'])
+
+  ch = logging.StreamHandler()
+  ch.setFormatter(formatter)
+  if scraper_opts['log-file'] is not None:
+    ch.setLevel(logging.INFO)
+  else:
+    ch.setLevel(scraper_opts['log_level'])
+
+  if scraper_opts['log-file'] is not None:
+    logging.getLogger().addHandler(fh)
+  logging.getLogger().addHandler(ch)
+
+  #logging.getLogger("urllib3").setLevel(logging.NOTSET)
+  # Disable all child loggers of urllib3, e.g. urllib3.connectionpool
+  logging.getLogger("urllib3").propagate = False
+
+  urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+  locale.setlocale(locale.LC_TIME, scraper_opts['lc_time'])
+
+  logging.info('==== Starting phpBB scraper for {}'.format(scraper_opts['url']) + ' ====')
 
   web = PhpBBScraper(scraper_opts, forums, topics)
 
@@ -1162,7 +1224,7 @@ def main():
   web.stats()
 
   end_ = time.time()
-  logging.info('Completed in {}'.format(datetime.timedelta(milliseconds=int((end_ - start_) * 1000))))
+  logging.info('==== Completed in {}'.format(datetime.timedelta(milliseconds=int((end_ - start_) * 1000))) + ' ====')
 
 if __name__ == '__main__':
   main()
