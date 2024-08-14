@@ -40,7 +40,7 @@ scraper_opts = {
   'save_users': False,
   'force': 0,
   'max_workers': 10,
-  'pool_size': 1000,
+  'pool_size': 1, #1000,
   'max_retries': 3,
   'timeout': 30.0,
   'passwords': {'f': {}, 't': {}, 'u': None}
@@ -200,9 +200,11 @@ class FileSaver:
 
   def scrape(self, resp, page_merger):
     fname = FileSaver.full_path(self._opts['output'], self._paths, self._fname)
+
+    #logging.debug('Saving {} [{} bytes]'.format(fname, len(resp.content)))
+    logging.debug('Saving {} [{} bytes, {}]'.format(fname, len(resp.content), resp.headers['Content-Type']))
+
     dname = os.path.dirname(fname)
-    logging.info('Saving {} [{} bytes]'.format(fname, len(resp.content)))
-    #logging.info('Saving {} [{} bytes, {}]'.format(fname, len(resp.content), resp.headers['Content-Type']))
 
     try:
       os.makedirs(dname, exist_ok=True)
@@ -613,6 +615,8 @@ class PhpBBTopic(PhpBBElement):
 
         # remove query string from URL
         i['src'] = i['src'].split('?', 1)[0]
+        i['src'] = i['src'].split('&', 1)[0]
+
         res['media'].append((os.path.basename(i['src']), i['src']))
 
       for i in content.select('img[height]'):
@@ -624,6 +628,7 @@ class PhpBBTopic(PhpBBElement):
 
         # remove query string from URL
         i['src'] = i['src'].split('?', 1)[0]
+        i['src'] = i['src'].split('&', 1)[0]
         res['media'].append((os.path.basename(i['src']), i['src']))
 
     self._replace_tags(content.select('img.postimage'), '[img]{}', '[/img]', lambda tag: tag['src'])
