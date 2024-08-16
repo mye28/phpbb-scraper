@@ -18,6 +18,8 @@ import orjson
 import getopt
 import locale
 import logging
+import logging.handlers
+import multiprocessing
 import urllib3
 import requests
 import datetime
@@ -32,7 +34,7 @@ scraper_opts = {
   'headers': {},
   'output': None,
   'log_level': logging.WARNING,
-  'log-file': None,
+  'log_file': None,
   'lc_time': ('ru_RU', 'utf-8'),
   'parse_date': False,
   'save_media': False,
@@ -40,9 +42,9 @@ scraper_opts = {
   'save_users': False,
   'force': 0,
   'max_workers': 10,
-  'pool_size': 1, #1000,
+  'pool_size': 1,
   'max_retries': 3,
-  'timeout': 30.0,
+  'timeout': (0.5, 15.0),
   'passwords': {'f': {}, 't': {}, 'u': None}
 }
 
@@ -68,11 +70,10 @@ def send_worker(r):
 
   # Only log if r has a url property and that property ends with .html
   if hasattr(r, 'url') and r.url.endswith('.html'):
-    logging.warning('After {} requests failed to fetch {}'.format(retry, r))
-  else:
     logging.debug('After {} requests failed to fetch {}'.format(retry, r))
+  else:
+    logging.warning('After {} requests failed to fetch {}'.format(retry, r))
   return None, None
-
 
 def scrape_worker(args):
   ok, obj, r, page_merger = args
@@ -84,6 +85,12 @@ def scrape_worker(args):
     return []
   
   pages = obj.scrape(r, page_merger)
+
+  if len(pages) == 0:
+    #logging.error('0 pages scraped from {}'.format(obj))
+    return None
+
+  logging.debug('Scraped {} pages from {}'.format(len(pages), obj))
   return pages
 
 
@@ -147,14 +154,9 @@ class PageMerger:
       logging.info('FORCE: Saving unmerged pages')
     for key, v in self._pages.items():
       v['data'] = list(filter(None, v['data']))
-      media.extend(v['class'].save(
-        session=v['session'], id=key,
-        data=v['data'], paths=v['paths'],
-        opts=v['opts']))
-
+      media.extend(v['class'].save(session=v['session'], id=key, data=v['data'], paths=v['paths'], opts=v['opts']))
     self._lock.release()
     return media
-
 
 class FileSaver:
   def __init__(self, opts, session, paths, fname, url, use_session=False):
@@ -175,14 +177,17 @@ class FileSaver:
   def __str__(self):
     return r'FileSaver<{} @ {}>'.format(self._fname, self._url)
 
-
   def __repr__(self):
     return self.__str__()
 
-
   def request(self):
+    #logging.debug('START FileSaver.request: timeout={}, {}'.format(self._opts['timeout'], self._url))
     r = self._session.get(self._url, timeout=self._opts['timeout'])
     r.obj = self
+    if r.status_code != 200:
+      logging.debug('END Failed to fetch {}: {}'.format(self._url, r.status_code))
+      return r
+    #logging.debug('END FileSaver.request: Type = {}, {}'.format(r.headers['Content-Type'], self._url))
     return r
 
 
@@ -199,10 +204,12 @@ class FileSaver:
 
 
   def scrape(self, resp, page_merger):
+    logging.debug('FileSaver.scrape: {} [{} bytes]'.format(self._url, len(resp.content)))
+    
     fname = FileSaver.full_path(self._opts['output'], self._paths, self._fname)
 
     #logging.debug('Saving {} [{} bytes]'.format(fname, len(resp.content)))
-    logging.debug('Saving {} [{} bytes, {}]'.format(fname, len(resp.content), resp.headers['Content-Type']))
+    #logging.debug('  Saving {} [{} bytes, {}]'.format(fname, len(resp.content), resp.headers['Content-Type']))
 
     dname = os.path.dirname(fname)
 
@@ -219,6 +226,8 @@ class FileSaver:
       logging.error('Unable to save file {}: {}'.format(fname, e))
       return []
 
+    #logging.debug('  Saved {} [{} bytes, {}]'.format(fname, len(resp.content), resp.headers['Content-Type']))
+
     return []
 
 
@@ -230,10 +239,8 @@ class PhpBBElement:
   def __str__(self):
     return r'<{}>'.format(self.__class__)
 
-
   def __repr__(self):
     return self.__str__()
-
 
   def _get_url_query(self, url):
     if isinstance(url, str):
@@ -254,6 +261,7 @@ class PhpBBElement:
 
 
   def _pagination(self):
+    
 
     self._path = []
 
@@ -322,6 +330,8 @@ class PhpBBForumPassword(PhpBBElement):
     for i in f[0].select('input[type="hidden"]'):
       self._params[i['name']] = i['value']
 
+    
+    #logging.debug('PhpBBForumPassword.__init__: {}'.format(self._url))
 
   def __str__(self):
     return r'PhpBBForumPassword<{}>'.format(self._url)
@@ -334,6 +344,8 @@ class PhpBBForumPassword(PhpBBElement):
 
 
   def scrape(self, resp, page_merger):
+    
+
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
 
     logging.debug('PhpBBForumPassword.scrape: {}'.format(self._page.title.string))
@@ -366,7 +378,8 @@ class PhpBBForum(PhpBBElement):
     self._session = session
     self._forum_id = int(forum_id)
     self._start = int(start)
-
+    
+    logging.debug('PhpBBForum.__init__: {}'.format(self._url(forum_id=self._forum_id, start=self._start)))
 
   def __str__(self):
     return r'PhpBBForum<id={} @ {}>'.format(self._forum_id, self._start)
@@ -379,7 +392,8 @@ class PhpBBForum(PhpBBElement):
 
 
   def scrape(self, resp, page_merger):
-    logging.debug('PhpBBForum.scrape:')
+    
+    logging.debug('PhpBBForum.scrape: URL = {}'.format(self._url(forum_id=self._forum_id, start=self._start)))
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
 
     msg = self._page.select('#message p')
@@ -415,7 +429,7 @@ class PhpBBForum(PhpBBElement):
     for f in self._page.select('div#page-body > div.forumbg li.row > dl > dt a.topictitle'):
       tid = int(self._get_url_query(f['href'])['t'])
       if tid not in self._opts['scraped_topics']:
-        logging.info('Queue forum {} topic {}'.format(self._forum_id, tid))
+        logging.debug('Queue forum {} topic {}'.format(self._forum_id, tid))
         pages.append(PhpBBTopic(self._opts, self._session, tid, 0))
 
     if self._start != 0:
@@ -458,18 +472,16 @@ class PhpBBTopic(PhpBBElement):
     self._topic_id = int(topic_id)
     self._start = int(start)    
 
-
   def __str__(self):
-    return r'PhpBBTopic<id={} @ {}>'.format(self._topic_id, self._start)
-
+    return r'PhpBBTopic<{}>'.format(self._url(self._url(topic_id=self._topic_id, start=self._start)))
 
   def request(self):
     r = self._session.get(self._url(topic_id=self._topic_id, start=self._start), timeout=self._opts['timeout'])
     r.obj = self
     return r
 
-
   def _parse_page(self):
+    
     
     for p in self._page.select('div.post'):
 
@@ -490,7 +502,15 @@ class PhpBBTopic(PhpBBElement):
         post['date'] = int(dateutil.parser.parse(post['date']).timestamp())
 
       content = p.select('#post_content{} > div.content'.format(pid))[0]
-      post.update(self._html2bb(content))
+
+      bbContent = self._html2bb(content)
+      if bbContent:
+        post.update(bbContent)
+      else:
+        logging.error('Failed to parse post {}. Url = {}'.format(pid, self._url(topic_id=self._topic_id, start=self._start, post=pid)))
+        return False
+
+        continue
 
       for img in p.select('dl.attachbox img.postimage'):
         post['files'].append((img['alt'], '{}/{}'.format(self._opts['url'], img['src'])))
@@ -501,6 +521,7 @@ class PhpBBTopic(PhpBBElement):
       post ['forum'] = self._forum_id
 
       self._posts.append(post)
+    return True
 
 
   def _unwrap_tag(self, tag, before, after, extract=None, cleanup=None):
@@ -550,132 +571,142 @@ class PhpBBTopic(PhpBBElement):
     return None      
 
   def _html2bb(self, content):
+
     res = {'files': []}
     if self._opts['save_media']:
       res['media'] = []
 
-    for img in content.select('div.inline-attachment > dl.thumbnail img.postimage'):
-      # HACK: drop '../' from URL
-      url = img['src'].replace('../', '')
-      res['files'].append((img['alt'], '{}/{}'.format(self._opts['url'], url)))
-      img.decompose()
+    try:
+      for img in content.select('div.inline-attachment > dl.thumbnail img.postimage'):
+        # HACK: drop '../' from URL
+        url = img['src'].replace('../', '')
+        res['files'].append((img['alt'], '{}/{}'.format(self._opts['url'], url)))
+        img.decompose()
 
-    for a in content.select('div.inline-attachment > dl.file a.postlink'):
-      # HACK: drop '../' from URL
-      url = a['href'].replace('../', '')
-      res['files'].append((a.string.strip(), '{}/{}'.format(self._opts['url'], url)))
-      a.decompose()
+      for a in content.select('div.inline-attachment > dl.file a.postlink'):
+        # HACK: drop '../' from URL
+        url = a['href'].replace('../', '')
+        res['files'].append((a.string.strip(), '{}/{}'.format(self._opts['url'], url)))
+        a.decompose()
 
-    # Drop "Edit by" notice message
-    for c in content.select('div.notice'):
-      c.decompose()
+      # Drop "Edit by" notice message
+      for c in content.select('div.notice'):
+        c.decompose()
 
-    # Drop buttons from spoiler div
-    for c in content.select('div > input.button2'):
-      c.decompose()
+      # Drop buttons from spoiler div
+      for c in content.select('div > input.button2'):
+        c.decompose()
 
-    # Drop signatures
-    for c in content.select('div.signature'):
-      c.decompose()
+      # Drop signatures
+      for c in content.select('div.signature'):
+        c.decompose()
 
-    # Unwrap [code] section
-    for c in content.select('div.codebox'):
-      c.p.decompose()
-      c.pre.code.unwrap()
-      c.pre.unwrap()
-      cp = self._page.new_tag('pre')
-      c.wrap(cp)
-      c.unwrap()
-      cp.string = cp.string.replace('\n', '&#10;')
+      # Unwrap [code] section
+      for c in content.select('div.codebox'):
+        c.p.decompose()
+        c.pre.code.unwrap()
+        c.pre.unwrap()
+        cp = self._page.new_tag('pre')
+        c.wrap(cp)
+        c.unwrap()
+        if cp.string:
+          cp.string = cp.string.replace('\n', '&#10;')
 
-    self._replace_tags(content.find_all('pre'), '[code]', '[/code]')
+      self._replace_tags(content.find_all('pre'), '[code]', '[/code]')
 
-    self._replace_tags(content.find_all('br'), '&#10;', '')
-    self._replace_tags(content.select('span[style*="text-decoration:underline"]'), '[u]', '[/u]')
-    self._replace_tags(content.select('span[style*="color:"]'), '[color={}]', '[/color]',
-      lambda tag: self._extract_style(tag, 'color'))
-    self._replace_tags(content.find_all('strong'), '[b]', '[/b]')
-    self._replace_tags(content.select('em.text-italics'), '[i]', '[/i]')
+      self._replace_tags(content.find_all('br'), '&#10;', '')
+      self._replace_tags(content.select('span[style*="text-decoration:underline"]'), '[u]', '[/u]')
+      self._replace_tags(content.select('span[style*="color:"]'), '[color={}]', '[/color]',
+        lambda tag: self._extract_style(tag, 'color'))
+      self._replace_tags(content.find_all('strong'), '[b]', '[/b]')
+      self._replace_tags(content.select('em.text-italics'), '[i]', '[/i]')
 
-    self._replace_tags(content.find_all('li'), '[*]', '')
-    self._replace_tags(content.select('ol[style*="list-style-type:lower-alpha"]'), '[list=a]', '[/list]')
-    self._replace_tags(content.select('ol[style*="list-style-type:decimal"]'), '[list=1]', '[/list]')
-    self._replace_tags(content.select('a.postlink'), '[url{}]', '[/url]',
-      lambda tag: '' if tag['href'] == tag.string else '={}'.format(tag['href']))
-    self._replace_tags(content.select('img.smilies'), '{}', '',
-      lambda tag: tag['alt'])
+      self._replace_tags(content.find_all('li'), '[*]', '')
+      self._replace_tags(content.select('ol[style*="list-style-type:lower-alpha"]'), '[list=a]', '[/list]')
+      self._replace_tags(content.select('ol[style*="list-style-type:decimal"]'), '[list=1]', '[/list]')
+      self._replace_tags(content.select('a.postlink'), '[url{}]', '[/url]',
+        lambda tag: '' if tag['href'] == tag.string else '={}'.format(tag['href']))
+      self._replace_tags(content.select('img.smilies'), '{}', '',
+        lambda tag: tag['alt'])
 
-    if self._opts['save_media']:
-      for i in content.select('img.postimage'):
-        if len(i['src']) == 0:
-          #logging.error('img.postimage: Empty src in {} (url = {})'.format(i, self._topic_id))
-          continue
-        if i['src'][0] == '.':
-          i['src'] = '{}/{}'.format(self._opts['url'], i['src'])
+      if self._opts['save_media']:
+        for i in content.select('img.postimage'):
+          if len(i['src']) == 0:
+            #logging.error('img.postimage: Empty src in {} (url = {})'.format(i, self._topic_id))
+            continue
+          if i['src'][0] == '.':
+            i['src'] = '{}/{}'.format(self._opts['url'], i['src'])
 
-        # remove query string from URL
-        i['src'] = i['src'].split('?', 1)[0]
-        i['src'] = i['src'].split('&', 1)[0]
+          # remove query string from URL
+          i['src'] = i['src'].split('?', 1)[0]
+          i['src'] = i['src'].split('&', 1)[0]
 
-        res['media'].append((os.path.basename(i['src']), i['src']))
+          res['media'].append((os.path.basename(i['src']), i['src']))
 
-      for i in content.select('img[height]'):
-        if len(i['src']) == 0:
-          #logging.error('img[height]: Empty src in {} (url = {})'.format(i, self._topic_id))
-          continue
-        if i['src'][0] == '.':
-          i['src'] = '{}/{}'.format(self._opts['url'], i['src'])
+        for i in content.select('img[height]'):
+          if len(i['src']) == 0:
+            #logging.error('img[height]: Empty src in {} (url = {})'.format(i, self._topic_id))
+            continue
+          if i['src'][0] == '.':
+            i['src'] = '{}/{}'.format(self._opts['url'], i['src'])
 
-        # remove query string from URL
-        i['src'] = i['src'].split('?', 1)[0]
-        i['src'] = i['src'].split('&', 1)[0]
-        res['media'].append((os.path.basename(i['src']), i['src']))
+          # remove query string from URL
+          i['src'] = i['src'].split('?', 1)[0]
+          i['src'] = i['src'].split('&', 1)[0]
+          res['media'].append((os.path.basename(i['src']), i['src']))
 
-    self._replace_tags(content.select('img.postimage'), '[img]{}', '[/img]', lambda tag: tag['src'])
-    self._replace_tags(content.select('img[height]'), '[fimg={}]{}', '[/fimg]', [lambda tag: tag['height'], lambda tag: tag['src']])
+      self._replace_tags(content.select('img.postimage'), '[img]{}', '[/img]', lambda tag: tag['src'])
+      self._replace_tags(content.select('img[height]'), '[fimg={}]{}', '[/fimg]', [lambda tag: tag['height'], lambda tag: tag['src']])
 
-    self._replace_tags(content.find_all('ul'), '[list]', '[/list]')
-    self._replace_tags(content.select('div[style*="padding:"]'), '[spoiler={}]', '[/spoiler]',
-      lambda tag: tag.span.text.strip().replace(']', '\\]'),
-      lambda tag: tag.span.decompose())
-    self._replace_tags(content.select('span[style*="font-size:"]'), '[size={}]', '[/size]',
-      lambda tag: self._extract_style(tag, 'font-size')[:-1])
+      self._replace_tags(content.find_all('ul'), '[list]', '[/list]')
+      self._replace_tags(content.select('div[style*="padding:"]'), '[spoiler={}]', '[/spoiler]',
+        lambda tag: tag.span.text.strip().replace(']', '\\]'),
+        lambda tag: tag.span.decompose())
+      self._replace_tags(content.select('span[style*="font-size:"]'), '[size={}]', '[/size]',
+        lambda tag: self._extract_style(tag, 'font-size')[:-1])
 
-    quotes = content.find_all('blockquote')
-    quotes.reverse()
-    for quote in quotes:
-      q = {'who': ''}
-      if quote.cite:
-        if not quote.cite.a:
-          if quote.cite.string:
-            q['who'] = '={}'.format(quote.cite.string.strip().rsplit(' ', 1)[0].replace(']', '\\]'))
-          elif quote.cite.text:
-            # A url?
-            q['who'] = '={}'.format(quote.cite.text)
-        else:
-          uq = self._get_url_query(quote.cite.a['href'])
-          if 'u' in uq:
-            q['who'] = '={} user_id={}'.format(
-              quote.cite.a.string.strip().replace(']', '\\]'),
-              uq['u'])
+      quotes = content.find_all('blockquote')
+      quotes.reverse()
+      for quote in quotes:
+        q = {'who': ''}
+        if quote.cite:
+          if not quote.cite.a:
+            if quote.cite.string:
+              q['who'] = '={}'.format(quote.cite.string.strip().rsplit(' ', 1)[0].replace(']', '\\]'))
+            elif quote.cite.text:
+              # A url?
+              q['who'] = '={}'.format(quote.cite.text)
           else:
-            q['who'] = '={}'.format(quote.cite.a.string.strip().replace(']', '\\]'))
-        pt = quote.cite.select('div.responsive-hide')
-        if pt:
-          qdate = pt[0].string.strip()
-          if self._opts['parse_date']:
-            qdate = int(dateutil.parser.parse(qdate).timestamp())
-          q['who'] += ' time={}'.format(qdate)
-        quote.cite.decompose()
+            uq = self._get_url_query(quote.cite.a['href'])
+            if 'u' in uq:
+              q['who'] = '={} user_id={}'.format(
+                quote.cite.a.string.strip().replace(']', '\\]'),
+                uq['u'])
+            else:
+              q['who'] = '={}'.format(quote.cite.a.string.strip().replace(']', '\\]'))
+          pt = quote.cite.select('div.responsive-hide')
+          if pt:
+            qdate = pt[0].string.strip()
+            if self._opts['parse_date']:
+              qdate = int(dateutil.parser.parse(qdate).timestamp())
+            q['who'] += ' time={}'.format(qdate)
+          quote.cite.decompose()
 
-      quote.div.unwrap()
-      self._unwrap_tag(quote, '[quote{}]'.format(q['who']), '[/quote]')
+        quote.div.unwrap()
+        self._unwrap_tag(quote, '[quote{}]'.format(q['who']), '[/quote]')
 
-    res['content'] = content.text.replace('\n', '').replace('&#10;', '\n')
+      res['content'] = content.text.replace('\n', '').replace('&#10;', '\n')
+
+    except Exception as e:
+      
+      logging.error('_html2bb Exception: {}'.format(e))
+      logging.error(' URL = {}'.format(self._url(topic_id=self._topic_id, start=self._start)))
+      return None
+
     return res
 
 
-  def _url(self, topic_id = 0, start = 0):
+  def _url(self, topic_id = 0, start = 0, post = 0):
     args = []
     if 'sid' in self._opts:
       args.append('sid={}'.format(self._opts['sid']))
@@ -683,15 +714,16 @@ class PhpBBTopic(PhpBBElement):
       args.append('t={}'.format(topic_id))
     if start:
       args.append('start={}'.format(start))
+    if post:
+      args.append('p={}'.format(post))
 
     return '{}/viewtopic.php?{}'.format(self._opts['url'], '&'.join(args))
 
 
   def scrape(self, resp, page_merger):
-    logging.info('PhpBBTopic')
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
 
-    logging.info('PhpBBTopic.scrape: {}'.format(self._page.title.string))
+    #logging.debug('PhpBBTopic.scrape: {}'.format(self._url(topic_id=self._topic_id, start=self._start)))
 
 #    self._page = BeautifulSoup('<html><body><blockquote><cite>asd]bbb</cite><div>LLLL</div></blockquote><div class="codebox"><p>KOD</p><pre><code>TEST CODE\nFFFF</code></pre></div><br/><span style="text-decoration:underline">UNDERLINE</span>\n\n<ul><li>ITEM1</li></ul><ol style="list-style-type:lower-alpha"><li>ITEM1</li></ol><ol style="list-style-type:decimal"><li>ITEM2</li></ol><img src="https://avatars.mds.yandex.net/get-banana/55914/x25Bic0D9kVbOCgUbeLnDbwof_banana_20161021_22_ret.png/optimize" height="200"><img src="https://avatars.mds.yandex.net/get-banana/55914/x25Bic0D9kVbOCgUbeLnDbwof_banana_20161021_22_ret.png/optimize"><a href="http://localhost/" class="postlink">http://localhost/</a><span style="color:red">RED</span><span style="font-size: 50%; line-height: normal">SMALL</span>&lt;aaa;&gt;&eacute;</body></html>', self._opts['parser'])
 #    self._html2bb(self._page)
@@ -718,7 +750,8 @@ class PhpBBTopic(PhpBBElement):
 
     url, start_value, pages_count = self._pagination()
     self._forum_id = self._path[-1]
-    self._parse_page()
+    if self._parse_page() == False:
+      return []
 
     if self._start != 0:
       return page_merger.append(self._topic_id, self._posts, self._start)
@@ -743,6 +776,8 @@ class PhpBBTopic(PhpBBElement):
 
   @staticmethod
   def save(session, id, data, paths, opts):
+    
+
     ospaths = [p[0] for p in paths]
     dname = os.path.join(opts['output'], *ospaths)
     fname = '{}.json'.format(os.path.join(dname, str(id)))
@@ -814,6 +849,8 @@ class PhpBBUsers(PhpBBElement):
 
 
   def scrape(self, resp, page_merger):
+    
+
     logging.info('PhpBBUsers.scrape')
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
 
@@ -890,6 +927,8 @@ class PhpBBUsers(PhpBBElement):
 
   @staticmethod
   def save(session, id, data, paths, opts):
+    
+
     ospaths = [p[0] for p in paths]
     dname = os.path.join(opts['output'], *ospaths)
     fname = '{}.json'.format(os.path.join(dname, str(id)))
@@ -915,8 +954,7 @@ class RequestsIter:
   def __init__(self, size):
     self._queue = mp.Manager().Queue(size)
     self._enqueued = 0
-    self.processed = 0
-
+    self._processed = 0
 
   def __next__(self):
     try:
@@ -933,19 +971,30 @@ class RequestsIter:
     if not self._queue.empty():
       return False
 
-    if self.processed < self._enqueued:
+    if self._processed < self._enqueued:
       return False
 
-    if self.processed > self._enqueued:
-      logging.info('Processed pages {} more than enqueued {}'.format(self.processed, self._enqueued))
+    if self._processed > self._enqueued:
+      logging.info('Processed {} pages; more than enqueued {}'.format(self._processed, self._enqueued))
     return True
 
 
-  def put(self, item):
-    logging.debug('Enqueue: {}'.format(item))
+  def put(self, item):    
     self._enqueued += 1
+    #logging.debug('put #{}: {}'.format(self._enqueued, item))
     self._queue.put(item)
 
+  def processed(self):
+    self._processed += 1
+    #logging.debug('processed #{}'.format(self._processed))
+
+  def reset(self):
+    if self._queue._qsize > 0:
+      logging.error('Queue is not empty')
+      
+    self._queue = mp.Manager().Queue(self._queue.maxsize)
+    self._enqueued = 0
+    self._processed = 0
 
 class PhpBBScraper:
   def __init__(self, opts, forums_arg, topics_arg):
@@ -960,7 +1009,7 @@ class PhpBBScraper:
     self._session.mount('https://', a)
     self._session.verify = False
     self._session.headers.update(opts['headers'])
-    self._queue = RequestsIter(self._opts['pool_size'] * 4)
+    self._queue = RequestsIter(-1) #self._opts['pool_size'] * 4)
     if not self._opts['force']:
       self._load_state()
 
@@ -972,34 +1021,39 @@ class PhpBBScraper:
     self._parse_arg(forums_arg, is_topics=False)
     self._parse_arg(topics_arg, is_topics=True)
 
-
   def is_done(self):
     return self._queue.is_done()
 
   def scrape(self):
-    logging.debug('PhpBBScraper.scrape: {}'.format(self._topics))
     self.enqueue(self._topics)
+    logging.debug('PhpBBScraper.scrape: Topics = {}, Enqueued = {}'.format(len(self._topics), self._queue._enqueued))
+
     self._topics = []
 
     pool = mp.pool.ThreadPool(processes=self._opts['pool_size'])
     while not self._queue.is_done():
       for response, obj in pool.imap_unordered(send_worker, self._queue):
+        #logging.debug ('send_worker done: {} {}'.format(self._queue.processed, obj))
         if response is None:
+          logging.debug('send_worker: None response')
           self.processed()
           yield (False, obj, None, None)
           continue
 
         if isinstance(obj, PhpBBTopic) and obj._start == 0:
+          #logging.debug('send_worker: isinstance(obj, PhpBBTopic) and obj._start == 0')
           self._processed_pages += 1
+          #logging.debug('Processed pages: {}'.format(self._processed_pages))
 
         if response.status_code == 200:
+          #logging.debug('send_worker: response.status_code == 200')
           # Yield good result, no response needed to pass back
           yield (True, obj, response, self._page_merger)
         else:
+          logging.debug('Bad status received: {}, {}'.format(response.status_code, obj))
           # Bad status received, push back the response details
           self.processed()
           yield (False, obj, response, None)
-
 
     pool.close()
     pool.join()
@@ -1009,23 +1063,22 @@ class PhpBBScraper:
     for p in pages:
       self._queue.put(p)
 
-
   def processed(self):
-    self._queue.processed += 1
+    self._queue.processed()
 
 
   def stats(self):
     tm = self._page_merger.stats()
     pages = ['{}\t{} of {}'.format(v['paths'], v['remain'], v['size']) for v in tm]
 
-    logging.info('============ STATS ===========')
+    logging.info('===== STATS =====')
     if self._opts['scraped_topics']:
-      logging.info('Already Scraped Topics: {}'.format(len(self._opts['scraped_topics'])))
-    logging.info('Processed Requests: {}'.format(self._queue.processed))
+      logging.info('     Already Scraped Topics: {}'.format(len(self._opts['scraped_topics'])))
+    logging.info('     Processed Requests: {}'.format(self._queue.processed))
     if self._processed_pages:
-      logging.info('Processed Pages: {}'.format(self._processed_pages))
+      logging.info('     Processed Pages: {}'.format(self._processed_pages))
     if pages:
-      logging.info('Hidden Posts:\n\t{}'.format('\n\t'.join(pages)))
+      logging.info('     Hidden Posts:\n\t{}'.format('\n\t'.join(pages)))
 
 
   def force_merge(self):
@@ -1067,6 +1120,7 @@ class PhpBBScraper:
 
 
   def _load_state(self):
+    
     logging.info('Searching for downloaded topics in {}'.format(self._opts['output']))
     for dname, subdirs, flist in os.walk(self._opts['output']):
       for f in flist:
@@ -1085,6 +1139,85 @@ def usage(rc):
   print('Usage: {} [-v|-h|-w workers|-p pool-size|-o output-dir|-a user-agent|-c cookie|-m|-s|[-t|-f] id[-id|,id] [-l log-file]] URL\n'.format(os.path.basename(sys.argv[0])))
   sys.exit(rc)
 
+
+## ---- Logging ----
+g_log_level = logging.INFO
+g_log_format = '%(asctime)s %(processName)-10s %(levelname)-8s %(message)s'
+g_log_file = 'scraper.log'
+
+#
+# Because you'll want to define the logging configurations for listener and workers, the
+# listener and worker process functions take a configurer parameter which is a callable
+# for configuring logging for that process. These functions are also passed the queue,
+# which they use for communication.
+#
+# In practice, you can configure the listener however you want, but note that in this
+# simple example, the listener does not apply level or filter logic to received records.
+# In practice, you would probably want to do this logic in the worker processes, to avoid
+# sending events which would be filtered out between processes.
+#
+# The size of the rotated files is made small so you can see the results easily.
+def listener_configurer(log_level, log_format, log_file):
+    root = logging.getLogger()
+
+    if log_file is not None:
+      fh = logging.handlers.RotatingFileHandler(log_file, 'a', 30000, 10)
+      fh.setFormatter(logging.Formatter(log_format))
+      root.addHandler(fh)
+    else:
+      ch = logging.StreamHandler()
+      ch.setFormatter(logging.Formatter(log_format))
+      root.addHandler(ch)
+
+    # ch = logging.StreamHandler()
+    # ch.setFormatter(logging.Formatter(log_format))
+
+    # if log_file is not None:
+    #   ch.setLevel(logging.INFO)
+    # else:
+    #   ch.setLevel(log_level)
+
+    # root.addHandler(ch)
+
+    #if log_file is not None:
+
+
+# This is the listener process top-level loop: wait for logging events
+# (LogRecords)on the queue and handle them, quit when you get a None for a
+# LogRecord.
+def listener_process(queue, configurer, log_level, log_format, log_file):
+    import sys, traceback
+    configurer(log_level, log_format, log_file)
+    while True:
+        try:
+            record = queue.get()
+            if record is None:  # We send this as a sentinel to tell the listener to quit.
+                #print('Quit listener_process:', file=sys.stderr)
+                break
+            logger = logging.getLogger(record.name)
+            logger.handle(record)  # No level or filter logic applied - just do it!
+        except Exception:
+            print('Whoops! Problem:', file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+def init_worker(configurer, queue, log_level):
+    configurer(queue, log_level)
+    # grab the number off the name of the process name (which is in the form "SpawnPoolWorker-N")
+    # and set it as the process name ("worker-N").
+    multiprocessing.current_process().name="Worker-{}".format(multiprocessing.current_process().name.split("-")[1])
+
+# The worker configuration is done at the start of the worker process run.
+# Note that on Windows you can't rely on fork semantics, so each process
+# will run the logging configuration code when it starts.
+def worker_configurer(queue, log_level):
+    h = logging.handlers.QueueHandler(queue)  # Just the one handler needed
+    root = logging.getLogger()
+    root.addHandler(h)
+    # send all messages, for demo; no other level or filter logic applied.
+    root.setLevel(log_level)
+    # Disable all child loggers of urllib3, e.g. urllib3.connectionpool
+    logging.getLogger("urllib3").propagate = False
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def main():
   # Clean up any extra spaces in the command-line arguments
@@ -1123,7 +1256,6 @@ def main():
 
   topics = []
   forums = []
-  logger_fmt='%(levelname)s: %(message)s'
 
   for o, a in opts:
     if o in ('-h', '--help'):
@@ -1153,83 +1285,85 @@ def main():
     elif o in ('-o', '--output='):
       scraper_opts['output'] = a
     elif o in ('-l', '--log-file='):
-      scraper_opts['log-file'] = a
+      scraper_opts['log_file'] = a
     elif o == '-v':
       if scraper_opts['log_level'] == logging.WARNING:
         scraper_opts['log_level'] = logging.INFO
       elif scraper_opts['log_level'] == logging.INFO:
         scraper_opts['log_level'] = logging.DEBUG
-      logger_fmt='%(levelname)s:%(asctime)s:%(name)s:%(process)s:%(thread)s:%(message)s'
+
+  if scraper_opts['log_file'] is None:
+    scraper_opts['log_level'] = logging.INFO
 
   if scraper_opts['output'] is None:
     scraper_opts['output'] = requests.utils.urlparse(scraper_opts['url']).netloc
 
-  start_ = time.time()
-
-  logging.getLogger().setLevel(logging.DEBUG)
-  formatter = logging.Formatter(logger_fmt)
-
-  if scraper_opts['log-file'] is not None:
-    fh = logging.FileHandler(scraper_opts['log-file'])
-    fh.setFormatter(formatter)
-    fh.setLevel(scraper_opts['log_level'])
-
-  ch = logging.StreamHandler()
-  ch.setFormatter(formatter)
-  if scraper_opts['log-file'] is not None:
-    ch.setLevel(logging.INFO)
-  else:
-    ch.setLevel(scraper_opts['log_level'])
-
-  if scraper_opts['log-file'] is not None:
-    logging.getLogger().addHandler(fh)
-  logging.getLogger().addHandler(ch)
-
-  #logging.getLogger("urllib3").setLevel(logging.NOTSET)
-  # Disable all child loggers of urllib3, e.g. urllib3.connectionpool
-  logging.getLogger("urllib3").propagate = False
-
-  urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
   locale.setlocale(locale.LC_TIME, scraper_opts['lc_time'])
 
+  global g_log_level
+  global g_log_format
+  global g_log_file
+
+  g_log_file = scraper_opts['log_file']
+  g_log_level = scraper_opts['log_level']
+
+
+  logQueue = multiprocessing.Queue(-1)
+  listener = multiprocessing.Process(target=listener_process, args=(logQueue, listener_configurer, g_log_level, g_log_format, g_log_file))
+  listener.start()
+  worker_configurer(logQueue, g_log_level)
+  multiprocessing.current_process().name="Main"
+
+  start_ = time.time()
   logging.info('==== Starting phpBB scraper for {}'.format(scraper_opts['url']) + ' ====')
 
-  web = PhpBBScraper(scraper_opts, forums, topics)
+  scraper = PhpBBScraper(scraper_opts, forums, topics)
+  pool = mp.Pool(processes=scraper_opts['max_workers'], initializer=init_worker, initargs=(worker_configurer,logQueue,g_log_level))
 
-  pool = mp.Pool(processes=scraper_opts['max_workers'])
+  doneProcessing = False
+  while doneProcessing == False:
+    for pages in pool.imap_unordered(func=scrape_worker, iterable=scraper.scrape()):
+        if pages is None:
+          scraper.processed()
+          continue
+        else:
+          scraper.enqueue(pages)
+          scraper.processed()
 
-  while True:
-    for pages in pool.imap_unordered(scrape_worker, web.scrape()):
-        web.enqueue(pages)
-        web.processed()
-
-    if web.is_done():
-        break  # Exit the loop if all work is done
+    if scraper.is_done():
+        doneProcessing = True  # Exit the loop if all work is done
     
   pool.close()
   pool.join()
 
-  media = web.force_merge()
+  logging.debug('DONE: phpBB scraper for {}'.format(scraper_opts['url']))
+
+  media = scraper.force_merge()
   if media:
     logging.info('FORCE: Fetching media from unmerged topics')
+    pool = mp.Pool(processes=scraper_opts['max_workers'], initializer=init_worker, initargs=(worker_configurer,logQueue,g_log_level))
+    scraper.enqueue(media)
+    doneProcessing = False
+    while doneProcessing == False:
+      for pages in pool.imap_unordered(scrape_worker, scraper.scrape()):
+        if pages is None:
+          continue
+        else:
+          scraper.enqueue(pages)
+          scraper.processed()
 
-    pool = mp.Pool(processes=scraper_opts['max_workers'])
-    web.enqueue(media)
-    while True:
-      for pages in pool.imap_unordered(scrape_worker, web.scrape()):
-        web.enqueue(pages)
-        web.processed()
-      if web.is_done():
-        break
+    if scraper.is_done():
+        doneProcessing = True  # Exit the loop if all work is done
 
     pool.close()
     pool.join()
 
-  web.stats()
-
+  scraper.stats()
   end_ = time.time()
   logging.info('==== Completed in {}'.format(datetime.timedelta(milliseconds=int((end_ - start_) * 1000))) + ' ====')
+
+  logQueue.put_nowait(None)
+  listener.join()
 
 if __name__ == '__main__':
   main()
