@@ -41,9 +41,10 @@ scraper_opts = {
   'save_attachments': False,
   'save_users': False,
   'force': 0,
-  'max_workers': 10,
+  'max_workers': 1000,
   'pool_size': 1,
   'max_retries': 3,
+  '502_delay': 10,
   'timeout': (0.5, 15.0),
   'passwords': {'f': {}, 't': {}, 'u': None}
 }
@@ -54,7 +55,24 @@ def send_worker(r):
   while retry < scraper_opts['max_retries']:
     try:
       req = r.request()
-      return req, req.obj
+      #logging.debug('send_worker: req = {}'.format(req))
+
+      if req is None:
+        logging.error('send_worker: not hasattr(req, status_code). r = {}'.format(r))
+        return None, None
+
+      if req.status_code == 200:
+        return req, req.obj
+
+      if req.status_code >= 500: # Server error
+        retry += 1
+        logging.error('  Delaying for {} seconds...'.format(scraper_opts['502_delay']))
+        time.sleep(scraper_opts['502_delay'])
+        continue
+
+      logging.error('Request failed {}, {}: {}'.format(r, req.url, req.status_code))
+      return req, None
+    
     except requests.exceptions.ConnectionError as e:
       retry += 1
     except requests.exceptions.InvalidSchema as e:
@@ -67,30 +85,35 @@ def send_worker(r):
       logging.error('Index error: {}'.format(e))
       logging.error('  URL: {}'.format(r))
       sys.exit(1)
+    except Exception as e:
+      logging.error('Error: {}'.format(e))
+      logging.error('  URL: {}'.format(r))
+      return None, None
 
-  # Only log if r has a url property and that property ends with .html
-  if hasattr(r, 'url') and r.url.endswith('.html'):
-    logging.debug('After {} requests failed to fetch {}'.format(retry, r))
+  # Only log if r has a url property is the content type is text/html
+  if hasattr(r, 'url') and r.headers['Content-Type'].startswith('text/html'):
+    logging.error('After {} requests failed to fetch {}'.format(retry, r.url))
   else:
-    logging.warning('After {} requests failed to fetch {}'.format(retry, r))
+    logging.debug('After {} requests failed to fetch {}'.format(retry, r))
   return None, None
 
 def scrape_worker(args):
   ok, obj, r, page_merger = args
   if obj is None:
-    return []
+    #logging.debug('scrape_worker obj is None. r = {}'.format(r))
+    return None
 
   if not ok:
-    #logging.warning('Failed to fetch {}'.format(obj))
+    logging.error('Failed to fetch {}: r = {}'.format(r.url, r.status_code))
     return []
   
   pages = obj.scrape(r, page_merger)
 
   if len(pages) == 0:
-    #logging.error('0 pages scraped from {}'.format(obj))
+    #logging.error('scrape_worker 0 pages scraped from {}'.format(obj))
     return None
 
-  logging.debug('Scraped {} pages from {}'.format(len(pages), obj))
+  #logging.debug('scrape_worker scraped {} pages from {}'.format(len(pages), obj))
   return pages
 
 
@@ -185,7 +208,7 @@ class FileSaver:
     r = self._session.get(self._url, timeout=self._opts['timeout'])
     r.obj = self
     if r.status_code != 200:
-      logging.debug('END Failed to fetch {}: {}'.format(self._url, r.status_code))
+      #logging.debug('END Failed to fetch {}: r = {}'.format(self._url, r.status_code))
       return r
     #logging.debug('END FileSaver.request: Type = {}, {}'.format(r.headers['Content-Type'], self._url))
     return r
@@ -379,7 +402,7 @@ class PhpBBForum(PhpBBElement):
     self._forum_id = int(forum_id)
     self._start = int(start)
     
-    logging.debug('PhpBBForum.__init__: {}'.format(self._url(forum_id=self._forum_id, start=self._start)))
+    #logging.debug('PhpBBForum.__init__: {}'.format(self._url(forum_id=self._forum_id, start=self._start)))
 
   def __str__(self):
     return r'PhpBBForum<id={} @ {}>'.format(self._forum_id, self._start)
@@ -473,11 +496,24 @@ class PhpBBTopic(PhpBBElement):
     self._start = int(start)    
 
   def __str__(self):
-    return r'PhpBBTopic<{}>'.format(self._url(self._url(topic_id=self._topic_id, start=self._start)))
+    return r'PhpBBTopic<{}>'.format(self._url(topic_id=self._topic_id, start=self._start))
 
   def request(self):
+    #logging.debug('START PhpBBTopic.request: {}'.format(self._url(topic_id=self._topic_id, start=self._start)))
     r = self._session.get(self._url(topic_id=self._topic_id, start=self._start), timeout=self._opts['timeout'])
     r.obj = self
+
+    # if r is invalid
+    if r is None:
+      #logging.debug('END PhpBBTopic.request: Failed to fetch {}. r is None'.format(self._url(topic_id=self._topic_id, start=self._start)))
+      return None
+
+    if r.status_code != 200:
+      #logging.debug('END PhpBBTopic.request: Failed to fetch {}: {}'.format(self._url(topic_id=self._topic_id, start=self._start), r.status_code))
+      return r
+
+    #logging.debug('END PhpBBTopic.request: {}'.format(self._url(topic_id=self._topic_id, start=self._start)))
+  
     return r
 
   def _parse_page(self):
@@ -1035,7 +1071,7 @@ class PhpBBScraper:
       for response, obj in pool.imap_unordered(send_worker, self._queue):
         #logging.debug ('send_worker done: {} {}'.format(self._queue.processed, obj))
         if response is None:
-          logging.debug('send_worker: None response')
+          #logging.debug('send_worker: None response')
           self.processed()
           yield (False, obj, None, None)
           continue
@@ -1045,18 +1081,27 @@ class PhpBBScraper:
           self._processed_pages += 1
           #logging.debug('Processed pages: {}'.format(self._processed_pages))
 
+        # if response doesn't have status_code attribute, it's a bad response
+        if not hasattr(response, 'status_code'):
+          logging.error('send_worker: not hasattr(response, status_code)')
+          self.processed()
+          yield (False, obj, response, None)
+
         if response.status_code == 200:
           #logging.debug('send_worker: response.status_code == 200')
           # Yield good result, no response needed to pass back
           yield (True, obj, response, self._page_merger)
         else:
-          logging.debug('Bad status received: {}, {}'.format(response.status_code, obj))
+          #logging.debug('Bad status received: {}, {}'.format(response.status_code, obj))
           # Bad status received, push back the response details
           self.processed()
           yield (False, obj, response, None)
 
     pool.close()
     pool.join()
+
+    #logging.debug('PhpBBScraper.scrape RETURN: Topics = {}, Enqueued = {}'.format(len(self._topics), self._queue._enqueued))
+    return []
 
 
   def enqueue(self, pages):
@@ -1160,26 +1205,17 @@ g_log_file = 'scraper.log'
 def listener_configurer(log_level, log_format, log_file):
     root = logging.getLogger()
 
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter(log_format))
+    root.addHandler(ch)
+    #print('Log Console: (level: {})'.format(logging.getLevelName(log_level)))
+
     if log_file is not None:
-      fh = logging.handlers.RotatingFileHandler(log_file, 'a', 30000, 10)
+      fh = logging.FileHandler(log_file)
       fh.setFormatter(logging.Formatter(log_format))
       root.addHandler(fh)
-    else:
-      ch = logging.StreamHandler()
-      ch.setFormatter(logging.Formatter(log_format))
-      root.addHandler(ch)
-
-    # ch = logging.StreamHandler()
-    # ch.setFormatter(logging.Formatter(log_format))
-
-    # if log_file is not None:
-    #   ch.setLevel(logging.INFO)
-    # else:
-    #   ch.setLevel(log_level)
-
-    # root.addHandler(ch)
-
-    #if log_file is not None:
+      # print that we're logging to a file, and pretty print the log level used
+      #print('Log file: {} (level: {})'.format(log_file, logging.getLevelName(log_level)))
 
 
 # This is the listener process top-level loop: wait for logging events
@@ -1195,7 +1231,15 @@ def listener_process(queue, configurer, log_level, log_format, log_file):
                 #print('Quit listener_process:', file=sys.stderr)
                 break
             logger = logging.getLogger(record.name)
-            logger.handle(record)  # No level or filter logic applied - just do it!
+
+            # If the record level is >= info or there's no log filename, just use the stream handler
+            if record.levelno >= logging.INFO or log_file is None:
+              logger.handlers[0].handle(record)
+
+            # Log to file if there's a handler          
+            if (len(logger.handlers) > 1):
+              logger.handlers[1].handle(record)  # No level or filter logic applied - just do it!
+
         except Exception:
             print('Whoops! Problem:', file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
@@ -1292,8 +1336,8 @@ def main():
       elif scraper_opts['log_level'] == logging.INFO:
         scraper_opts['log_level'] = logging.DEBUG
 
-  if scraper_opts['log_file'] is None:
-    scraper_opts['log_level'] = logging.INFO
+  # if scraper_opts['log_file'] is None:
+  #   scraper_opts['log_level'] = logging.INFO
 
   if scraper_opts['output'] is None:
     scraper_opts['output'] = requests.utils.urlparse(scraper_opts['url']).netloc
@@ -1322,6 +1366,7 @@ def main():
 
   doneProcessing = False
   while doneProcessing == False:
+    #logging.debug('phpBB scraper: doneProcessing = {}'.format(doneProcessing))
     for pages in pool.imap_unordered(func=scrape_worker, iterable=scraper.scrape()):
         if pages is None:
           scraper.processed()
